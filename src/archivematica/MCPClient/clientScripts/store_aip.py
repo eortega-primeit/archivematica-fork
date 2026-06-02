@@ -16,6 +16,7 @@
 # You should have received a copy of the GNU General Public License
 # along with Archivematica.  If not, see <http://www.gnu.org/licenses/>.
 import argparse
+import json
 import os
 from pprint import pformat
 from uuid import uuid4
@@ -54,6 +55,7 @@ def _create_file(
     size,
     sip_type,
     related_package_uuid,
+    misc_attributes=None,
 ):
     try:
         new_file = storage_service.create_file(
@@ -69,6 +71,7 @@ def _create_file(
             related_package_uuid=related_package_uuid,
             events=get_events_from_db(uuid),
             agents=get_agents_from_db(uuid),
+            misc_attributes=misc_attributes,
         )
     except storage_service.Error as err:
         raise StorageServiceCreateFileError(err)
@@ -157,13 +160,13 @@ def store_aip(job, aip_destination_uri, aip_path, sip_uuid, sip_name, sip_type):
             )
     else:
         uuid = sip_uuid
-        try:
-            related_package = UnitVariable.objects.get(
-                unituuid=sip_uuid, variable="relatedPackage"
-            )
-        except (UnitVariable.DoesNotExist, ValidationError):
-            pass
-        else:
+        # Use filter().order_by('-pk').first() to handle multiple UnitVariable rows
+        related_package = (
+            UnitVariable.objects.filter(unittype="SIP", unituuid=sip_uuid, variable="relatedPackage")
+            .order_by("-pk")
+            .first()
+        )
+        if related_package:
             related_package_uuid = related_package.variablevalue
 
     # If AIP is a directory, calculate size recursively
@@ -189,6 +192,45 @@ def store_aip(job, aip_destination_uri, aip_path, sip_uuid, sip_name, sip_type):
     else:
         aip_subtype = dc.type
 
+    # Obtener misc_attributes de UnitVariable
+    # Merge all misc_attributes UnitVariable rows for this SIP.
+    # This is required because different parts of the workflow may persist
+    # separate misc_attributes payloads, e.g. one row with IPDS flags and
+    # another row with encryption metadata like user_id/object_salt.
+    misc_attributes = {}
+
+    misc_attribute_rows = (
+        UnitVariable.objects.filter(
+            unittype="SIP",
+            unituuid=sip_uuid,
+            variable="misc_attributes",
+        ).order_by("pk")
+    )
+
+    for unit_var in misc_attribute_rows:
+        if not unit_var.variablevalue:
+            continue
+        try:
+            parsed = json.loads(unit_var.variablevalue)
+        except json.JSONDecodeError:
+            logger.warning(
+                "Could not decode misc_attributes UnitVariable for SIP %s: %r",
+                sip_uuid,
+                unit_var.variablevalue,
+            )
+            continue
+        if isinstance(parsed, dict):
+            misc_attributes.update(parsed)
+
+    if not misc_attributes:
+        misc_attributes = None
+    else:
+        logger.info(
+            "Merged misc_attributes for SIP %s: %s",
+            sip_uuid,
+            pformat(misc_attributes),
+        )
+
     # Store the AIP
     try:
         new_file = _create_file(
@@ -202,6 +244,7 @@ def store_aip(job, aip_destination_uri, aip_path, sip_uuid, sip_name, sip_type):
             size,
             sip_type,
             related_package_uuid,
+            misc_attributes,
         )
     except StorageServiceCreateFileError as err:
         errmsg = f"{sip_type} creation failed: {err}."

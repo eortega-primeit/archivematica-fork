@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import requests
 import shutil
 import uuid
 from cgi import parse_header
@@ -578,6 +579,21 @@ def reingest(request, target):
     error = None
     sip_name = request.POST.get("name")
     sip_uuid = request.POST.get("uuid")
+    # Read custom IPDS flags
+    ipds_re_preservation = request.POST.get("ipds-re-preservation", "false").lower() in ("true", "1", "yes")
+    ipds_doc_name = request.POST.get("ipds-doc-name", "").strip()  # optional: filter by doc filename
+    ipds_doc_id = request.POST.get("ipds-doc-id", "").strip()  # optional: document identifier for IPDS events
+
+    LOGGER.info(
+        "[ipds-re-preservation] reingest request received: sip_uuid=%s, target=%s, ipds_re_preservation=%s, ipds_doc_name=%s",
+        sip_uuid,
+        target,
+        ipds_re_preservation,
+        ipds_doc_name or "(all files)",
+    )
+    if ipds_doc_id:
+        LOGGER.info("[ipds-re-preservation] reingest request received: ipds_doc_id=%s", ipds_doc_id)
+
     if not all([sip_name, sip_uuid]):
         response = {"error": True, "message": '"name" and "uuid" are required.'}
         return helpers.json_response(response, status_code=400)
@@ -656,6 +672,33 @@ def reingest(request, target):
         response = {"error": True, "message": error}
         return helpers.json_response(response, status_code=500)
     else:
+        # Persist ipds flags in UnitVariable so microservices can read it
+        if ipds_re_preservation or ipds_doc_name or ipds_doc_id:
+             unit_type = "SIP" if target == "ingest" else "Transfer"
+             misc_attributes = {}
+             if ipds_re_preservation:
+                 misc_attributes["ipds-re-preservation"] = True
+             if ipds_doc_name:
+                 misc_attributes["ipds-doc-name"] = ipds_doc_name
+             if ipds_doc_id:
+                 misc_attributes["ipds-doc-id"] = ipds_doc_id
+             models.UnitVariable.objects.update_or_create(
+                 unittype=unit_type,
+                 unituuid=reingest_uuid,
+                 variable="misc_attributes",
+                 defaults={"variablevalue": json.dumps(misc_attributes)},
+             )
+             LOGGER.info(
+                 "[ipds] UnitVariable persisted: unittype=%s, unituuid=%s, value=%s",
+                 unit_type,
+                 reingest_uuid,
+                 misc_attributes,
+             )
+        else:
+            LOGGER.info(
+                "[ipds-re-preservation] flag is False for reingest_uuid=%s — normal validation will run",
+                reingest_uuid,
+            )
         response = {"message": "Approval successful.", "reingest_uuid": reingest_uuid}
         return helpers.json_response(response)
 
@@ -840,6 +883,16 @@ def _package_create(request):
     processing_config = payload.get("processing_config")
     if processing_config is not None:
         kwargs["processing_config"] = processing_config
+    
+    # Capturar user_id y object_salt para misc_attributes
+    misc_attributes = {}
+    if payload.get("user_id"):
+        misc_attributes["user_id"] = payload.get("user_id")
+    if payload.get("object_salt"):
+        misc_attributes["object_salt"] = payload.get("object_salt")
+    if misc_attributes:
+        kwargs["misc_attributes"] = misc_attributes
+    
     try:
         client = MCPClient(request.user)
         id_ = client.create_package(*args, **kwargs)

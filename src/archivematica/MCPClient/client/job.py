@@ -21,6 +21,7 @@ from typing import Union
 
 from django.conf import settings
 from django.utils import timezone
+from django.db import utils as db_utils
 
 from archivematica.dashboard.main.models import Task
 
@@ -116,7 +117,89 @@ class Job:
                     "stderror": self.get_stderr(),
                 }
             )
-        Task.objects.filter(taskuuid=self.uuid).update(**kwargs)
+        try:
+            Task.objects.filter(taskuuid=self.uuid).update(**kwargs)
+        except db_utils.OperationalError as exc:
+            # MySQL/MariaDB may reject 4-byte UTF-8 characters (emojis) if the
+            # column/table charset is not utf8mb4. Attempt a best-effort
+            # sanitization of stdout/stderror by removing characters that when
+            # encoded in UTF-8 take more than 3 bytes (i.e., non-BMP characters),
+            # which covers surrogate-pair representations on narrow builds.
+            msg = str(exc)
+            if "Incorrect string value" in msg or "1366" in msg:
+                logger.warning(
+                    "Task update failed due to incompatible characters in output; attempting to sanitize and retry"
+                )
+
+                def _sanitize(s: Optional[str]) -> Optional[str]:
+                    if s is None:
+                        return s
+                    try:
+                        # Keep only characters whose utf-8 encoding is <= 3 bytes
+                        out_chars = []
+                        for ch in s:
+                            try:
+                                if len(ch.encode("utf-8")) <= 3:
+                                    out_chars.append(ch)
+                            except Exception:
+                                # If encoding fails for a character, skip it
+                                continue
+                        sanitized = "".join(out_chars)
+                        # Replace any remaining ill-formed sequences just in case
+                        return sanitized.encode("utf-8", "replace").decode("utf-8", "replace")
+                    except Exception:
+                        # As a last resort, coerce to str and replace errors
+                        try:
+                            return str(s).encode("utf-8", "replace").decode("utf-8", "replace")
+                        except Exception:
+                            return None
+
+                # Important: the OperationalError may have left the DB connection
+                # in a broken transaction state. Close all connections to ensure
+                # a fresh connection is used for the retry attempts.
+                try:
+                    from django import db as django_db
+                    django_db.connections.close_all()
+                except Exception:
+                    # If closing connections fails, continue and attempts below
+                    # may still fail; we will handle that.
+                    logger.debug("Failed to close DB connections before retry; continuing anyway")
+
+                kwargs_sanitized = kwargs.copy()
+                if "stdout" in kwargs_sanitized:
+                    kwargs_sanitized["stdout"] = _sanitize(kwargs_sanitized.get("stdout"))
+                if "stderror" in kwargs_sanitized:
+                    kwargs_sanitized["stderror"] = _sanitize(kwargs_sanitized.get("stderror"))
+
+                # Retry once with sanitized content using a fresh connection
+                try:
+                    Task.objects.filter(taskuuid=self.uuid).update(**kwargs_sanitized)
+                    return
+                except Exception:
+                    # Second attempt failed; try one more fallback by removing
+                    # the output fields entirely and updating again.
+                    try:
+                        # Close connections again before final fallback
+                        try:
+                            django_db.connections.close_all()
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+
+                    fallback = kwargs_sanitized.copy()
+                    if "stdout" in fallback:
+                        fallback["stdout"] = None
+                    if "stderror" in fallback:
+                        fallback["stderror"] = None
+                    try:
+                        Task.objects.filter(taskuuid=self.uuid).update(**fallback)
+                        return
+                    except Exception:
+                        logger.exception("Failed to update Task status for failed job after sanitization and fallback")
+                        raise
+            else:
+                raise
 
     def set_status(self, int_code: int, status_code: str = "success") -> None:
         if int_code:

@@ -178,6 +178,7 @@ class MCPClient:
         auto_approve=True,
         wait_until_complete=False,
         processing_config=None,
+        misc_attributes=None,
     ):
         data = {
             "name": name,
@@ -191,6 +192,8 @@ class MCPClient:
         }
         if processing_config is not None:
             data["processing_config"] = processing_config
+        if misc_attributes is not None:
+            data["misc_attributes"] = misc_attributes
         return self._rpc_sync_call("packageCreate", data)
 
     def approve_transfer_by_path(self, db_transfer_path, transfer_type):

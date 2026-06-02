@@ -345,6 +345,7 @@ def create_file(
     events=None,
     agents=None,
     aip_subtype=None,
+    misc_attributes=None,
 ):
     """Creates a new file.
 
@@ -379,6 +380,8 @@ def create_file(
         "events": events,
         "agents": agents,
     }
+    if misc_attributes:
+        new_file["misc_attributes"] = misc_attributes
 
     LOGGER.info("Creating file with %s", new_file)
     errmsg = "Unable to create file from %s because %s"

@@ -261,6 +261,9 @@ class RPCServer(GearmanWorker):
         processing_config = payload.get("processing_config")
         if processing_config is not None:
             kwargs["processing_config"] = processing_config
+        misc_attributes = payload.get("misc_attributes")
+        if misc_attributes is not None:
+            kwargs["misc_attributes"] = misc_attributes
         return create_package(*args, **kwargs).pk
 
     def _approve_transfer_by_path_handler(self, worker, job, payload):

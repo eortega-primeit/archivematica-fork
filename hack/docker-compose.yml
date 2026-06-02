@@ -3,18 +3,10 @@ name: am
 
 volumes:
 
-  # Internal named volumes.
-  # These are not accessible outside of the docker host and are maintained by
-  # Docker.
   mysql_data:
   elasticsearch_data:
   archivematica_storage_service_staging_data:
 
-  # External named volumes.
-  # These are intended to be accessible beyond the docker host (e.g. via NFS).
-  # They use bind mounts to mount a specific "local" directory on the docker
-  # host - the expectation being that these directories are actually mounted
-  # filesystems from elsewhere.
   archivematica_pipeline_data:
     name: "am-pipeline-data"
     external: true
@@ -23,7 +15,6 @@ volumes:
     name: "ss-location-data"
     external: true
 
-
 services:
 
   mysql:
@@ -31,9 +22,9 @@ services:
     command: "--character-set-server=utf8mb4 --collation-server=utf8mb4_0900_ai_ci"
     environment:
       MYSQL_ROOT_PASSWORD: "12345"
-      # These are used in the settings.testmysql modules
       MYSQL_USER: "archivematica"
       MYSQL_PASSWORD: "demo"
+      MYSQL_DATABASE: "MCP"
     volumes:
       - "./etc/mysql/tuning.cnf:/etc/my.cnf.d/tuning.cnf:ro"
       - "mysql_data:/var/lib/mysql"
@@ -41,6 +32,12 @@ services:
       - "127.0.0.1:62001:3306"
     cap_add:
       - "SYS_NICE"
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -p12345 --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
 
   elasticsearch:
     image: "docker.elastic.co/elasticsearch/elasticsearch:8.19.3"
@@ -91,6 +88,9 @@ services:
       - "127.0.0.1:62006:3310"
     volumes:
       - "archivematica_pipeline_data:/var/archivematica/sharedDirectory:ro"
+    depends_on:
+      mysql:
+        condition: service_healthy
 
   nginx:
     image: "nginx:1.29.1"
@@ -110,7 +110,7 @@ services:
         TARGET: "archivematica-mcp-server"
         USER_ID: ${USER_ID:-1000}
         GROUP_ID: ${GROUP_ID:-1000}
-        UBUNTU_VERSION: ${UBUNTU_VERSION:-24.04}
+        UBUNTU_VERSION: ${UBUNTU_VERSION:-22.04}
         PYTHON_VERSION: ${PYTHON_VERSION:-3.9}
     environment:
       DJANGO_SECRET_KEY: "12345"
@@ -126,6 +126,11 @@ services:
     volumes:
       - "../:/src"
       - "archivematica_pipeline_data:/var/archivematica/sharedDirectory:rw"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      gearmand:
+        condition: service_started
     links:
       - "mysql"
       - "gearmand"
@@ -138,7 +143,7 @@ services:
         TARGET: "archivematica-mcp-client"
         USER_ID: ${USER_ID:-1000}
         GROUP_ID: ${GROUP_ID:-1000}
-        UBUNTU_VERSION: ${UBUNTU_VERSION:-24.04}
+        UBUNTU_VERSION: ${UBUNTU_VERSION:-22.04}
         PYTHON_VERSION: ${PYTHON_VERSION:-3.9}
     environment:
       DJANGO_SECRET_KEY: "12345"
@@ -155,7 +160,7 @@ services:
       ARCHIVEMATICA_MCPCLIENT_MCPCLIENT_CLAMAV_CLIENT_MAX_FILE_SIZE: "42"
       ARCHIVEMATICA_MCPCLIENT_MCPCLIENT_CLAMAV_CLIENT_MAX_SCAN_SIZE: "42"
       ARCHIVEMATICA_MCPCLIENT_MCPCLIENT_CLAMAV_CLIENT_MAX_STREAM_LENGTH: "100"
-      ARCHIVEMATICA_MCPCLIENT_MCPCLIENT_CLAMAV_CLIENT_BACKEND: "clamdscanner" # Option: clamdscanner or clamscan;
+      ARCHIVEMATICA_MCPCLIENT_MCPCLIENT_CLAMAV_CLIENT_BACKEND: "clamdscanner"
       ARCHIVEMATICA_MCPCLIENT_MCPCLIENT_PROMETHEUS_BIND_PORT: "7999"
       ARCHIVEMATICA_MCPCLIENT_MCPCLIENT_PROMETHEUS_BIND_ADDRESS: "0.0.0.0"
       ARCHIVEMATICA_MCPCLIENT_MCPCLIENT_METADATA_XML_VALIDATION_ENABLED: "true"
@@ -164,6 +169,15 @@ services:
     volumes:
       - "../:/src"
       - "archivematica_pipeline_data:/var/archivematica/sharedDirectory:rw"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      gearmand:
+        condition: service_started
+      clamavd:
+        condition: service_started
     links:
       - "clamavd"
       - "mysql"
@@ -179,7 +193,7 @@ services:
         TARGET: "archivematica-dashboard"
         USER_ID: ${USER_ID:-1000}
         GROUP_ID: ${GROUP_ID:-1000}
-        UBUNTU_VERSION: ${UBUNTU_VERSION:-24.04}
+        UBUNTU_VERSION: ${UBUNTU_VERSION:-22.04}
         PYTHON_VERSION: ${PYTHON_VERSION:-3.9}
     environment:
       FORWARDED_ALLOW_IPS: "*"
@@ -200,9 +214,12 @@ services:
       - "../:/src"
       - "archivematica_pipeline_data:/var/archivematica/sharedDirectory:rw"
     depends_on:
+      mysql:
+        condition: service_healthy
       elasticsearch:
         condition: service_healthy
-        restart: true
+      gearmand:
+        condition: service_started
     links:
       - "mysql"
       - "gearmand"
@@ -216,7 +233,7 @@ services:
         TARGET: "archivematica-storage-service"
         USER_ID: ${USER_ID:-1000}
         GROUP_ID: ${GROUP_ID:-1000}
-        UBUNTU_VERSION: ${UBUNTU_VERSION:-24.04}
+        UBUNTU_VERSION: ${UBUNTU_VERSION:-22.04}
         PYTHON_VERSION: ${PYTHON_VERSION:-3.9}
     environment:
       FORWARDED_ALLOW_IPS: "*"
@@ -234,5 +251,8 @@ services:
       - "archivematica_pipeline_data:/var/archivematica/sharedDirectory:rw"
       - "archivematica_storage_service_staging_data:/var/archivematica/storage_service:rw"
       - "archivematica_storage_service_location_data:/home:rw"
+    depends_on:
+      mysql:
+        condition: service_healthy
     links:
       - "mysql"

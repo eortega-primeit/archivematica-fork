@@ -128,6 +128,23 @@ def call(jobs):
                     else:
                         sip.update_active_agent(agent.userprofile.user_id)
 
+                # Copiar misc_attributes del Transfer al SIP
+                try:
+                    transfer_misc_var = UnitVariable.objects.get(
+                        unittype="Transfer",
+                        unituuid=transferUUID,
+                        variable="misc_attributes"
+                    )
+                    # Copiar a SIP creando un nuevo UnitVariable
+                    UnitVariable.objects.create(
+                        unittype="SIP",
+                        unituuid=sip_uuid,
+                        variable="misc_attributes",
+                        variablevalue=transfer_misc_var.variablevalue
+                    )
+                except (UnitVariable.DoesNotExist, ValidationError):
+                    pass
+
                 # Move the objects to the SIPDir
                 for item in os.listdir(objectsDirectory):
                     src_path = os.path.join(objectsDirectory, item)

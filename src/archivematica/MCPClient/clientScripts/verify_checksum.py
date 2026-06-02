@@ -28,6 +28,7 @@ us to easily call each of the tools packaged against its different algorithms:
 """
 
 import datetime
+import json
 import os
 import subprocess
 import sys
@@ -41,8 +42,25 @@ from archivematica.archivematicaCommon.custom_handlers import get_script_logger
 from archivematica.dashboard.main.models import Event
 from archivematica.dashboard.main.models import File
 from archivematica.dashboard.main.models import Transfer
+from archivematica.dashboard.main.models import UnitVariable
 
 logger = get_script_logger("archivematica.mcp.client.verify_checksum")
+
+
+def _get_ipds_re_preservation(unit_uuid):
+    for unit_type in ("Transfer", "SIP"):
+        try:
+            unit_var = UnitVariable.objects.get(
+                unittype=unit_type,
+                unituuid=unit_uuid,
+                variable="misc_attributes",
+            )
+            attrs = json.loads(unit_var.variablevalue or "{}")
+            if attrs.get("ipds-re-preservation"):
+                return True
+        except UnitVariable.DoesNotExist:
+            continue
+    return False
 
 
 class NoHashCommandAvailable(Exception):
@@ -289,4 +307,11 @@ def call(jobs):
     """Primary entry point for MCP Client script."""
     for job in jobs:
         with job.JobContext(logger=logger):
+            transfer_uuid = job.args[2] if len(job.args) > 2 else None
+            if transfer_uuid and _get_ipds_re_preservation(transfer_uuid):
+                job.pyprint(
+                    "ipds-re-preservation=True: skipping checksum verification."
+                )
+                job.set_status(0)
+                continue
             job.set_status(run_hashsum_commands(job))

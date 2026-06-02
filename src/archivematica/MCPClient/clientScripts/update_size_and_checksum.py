@@ -244,10 +244,17 @@ def call(jobs):
             derivation = file_info.pop("derivation", None)
             format_version = file_info.pop("formatVersion", None)
             if derivation is not None:
-                insertIntoDerivations(
-                    sourceFileUUID=file_uuid,
-                    derivedFileUUID=derivation,
-                )
+                if File.objects.filter(uuid=derivation).exists():
+                    insertIntoDerivations(
+                        sourceFileUUID=file_uuid,
+                        derivedFileUUID=derivation,
+                    )
+                else:
+                    logger.warning(
+                        "Skipping derivation for file %s: derived file %s does not exist in Files table (ipds-re-preservation reingest).",
+                        file_uuid,
+                        derivation,
+                    )
             if format_version is not None:
                 FileFormatVersion.objects.create(
                     file_uuid_id=file_uuid,

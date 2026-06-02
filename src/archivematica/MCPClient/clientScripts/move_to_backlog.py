@@ -8,6 +8,7 @@ The local copy is removed.
 PREMIS events are created after this job runs as part of the workflow.
 """
 
+import json
 import multiprocessing
 import os
 import pprint
@@ -48,7 +49,7 @@ class StorageServiceCreateFileError(Exception):
 
 
 def _create_file(
-    transfer_id, current_location, relative_transfer_path, backlog, backlog_path, size
+    transfer_id, current_location, relative_transfer_path, backlog, backlog_path, size, misc_attributes=None
 ):
     """Store the transfer in the backlog location.
 
@@ -63,6 +64,7 @@ def _create_file(
             current_path=backlog_path,
             package_type="transfer",  # TODO use constant from storage service
             size=size,
+            misc_attributes=misc_attributes,
         )
     except storage_service.Error as err:
         raise StorageServiceCreateFileError(err)
@@ -230,6 +232,18 @@ def main(job, transfer_id, transfer_path, created_at):
     transfer_name = os.path.basename(transfer_path.rstrip("/"))
     backlog_path = os.path.join("originals", transfer_name)
 
+    # Obtener misc_attributes de UnitVariable
+    misc_attributes = None
+    try:
+        unit_var = UnitVariable.objects.get(
+            unittype="Transfer",
+            unituuid=transfer_id,
+            variable="misc_attributes"
+        )
+        misc_attributes = json.loads(unit_var.variablevalue) if unit_var.variablevalue else None
+    except (UnitVariable.DoesNotExist, ValidationError, json.JSONDecodeError):
+        pass
+
     logger.info("Moving transfer to backlog...")
     try:
         new_file = _create_file(
@@ -239,6 +253,7 @@ def main(job, transfer_id, transfer_path, created_at):
             backlog,
             backlog_path,
             size,
+            misc_attributes,
         )
     except StorageServiceCreateFileError as err:
         errmsg = f"Moving to backlog failed: {err}."

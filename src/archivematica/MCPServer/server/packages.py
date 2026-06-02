@@ -306,6 +306,7 @@ def create_package(
     workflow,
     auto_approve=True,
     processing_config=None,
+    misc_attributes=None,
 ):
     """Launch transfer and return its object immediately.
 
@@ -346,6 +347,17 @@ def create_package(
         processing_config = "default"
     transfer.set_processing_configuration(processing_config)
     transfer.update_active_agent(user_id)
+    
+    # Almacenar misc_attributes en UnitVariable si se proporcionan
+    if misc_attributes:
+        import json
+        models.UnitVariable.objects.create(
+            unittype="Transfer",
+            unituuid=transfer.uuid,
+            variable="misc_attributes",
+            variablevalue=json.dumps(misc_attributes)
+        )
+    
     logger.debug("Transfer object created: %s", transfer.pk)
 
     # TODO: use tempfile.TemporaryDirectory as a context manager in Py3.
