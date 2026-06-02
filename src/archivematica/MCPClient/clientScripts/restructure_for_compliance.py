@@ -96,8 +96,36 @@ def _job_log(job, level, msg, icon_key=None, *args, **kwargs):
     else:
         logger.info(log_msg)
 
+def _env_str(name, default=None):
+    return os.environ.get(name, default)
 
-def _fetch_cognito_token(django_settings, job, timeout=None):
+
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _env_bool(name, default):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _env_json_dict(name, default=None):
+    raw = os.environ.get(name)
+    if not raw:
+        return {} if default is None else default
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else ({} if default is None else default)
+    except Exception:
+        logger.warning("Invalid JSON in environment variable %s: %r", name, raw)
+        return {} if default is None else default
+
+def _fetch_cognito_token(job, timeout=None):
     """Fetch an OAuth2 token from Cognito using client_credentials.
 
     Uses an in-memory cache keyed to the process lifetime to avoid repeated
@@ -106,34 +134,19 @@ def _fetch_cognito_token(django_settings, job, timeout=None):
 
     Returns the access_token string or None on failure.
     """
-    # Defaults provided by the user (used only if settings are missing).
-    DEFAULT_CLIENT_ID = getattr(
-        django_settings, "IPDS_RE_PRESERVATION_COGNITO_CLIENT_ID", "4jheas80l5e79c4peue3gonh7m"
-    )
-    DEFAULT_CLIENT_SECRET = getattr(
-        django_settings,
-        "IPDS_RE_PRESERVATION_COGNITO_CLIENT_SECRET",
-        "pc6n26cdc60efn99vi8ms8if636g6i0btaeuamo2ooho57qlouh",
-    )
-    DEFAULT_TOKEN_URL = getattr(
-        django_settings,
-        "IPDS_RE_PRESERVATION_COGNITO_TOKEN_URL",
-        "https://api-auth-dev-logalty.auth.eu-west-1.amazoncognito.com/oauth2/token",
-    )
+    DEFAULT_CLIENT_ID = "4jheas80l5e79c4peue3gonh7m"
+    DEFAULT_CLIENT_SECRET = "pc6n26cdc60efn99vi8ms8if636g6i0btaeuamo2ooho57qlouh"
+    DEFAULT_TOKEN_URL = "https://api-auth-dev-logalty.auth.eu-west-1.amazoncognito.com/oauth2/token"
+    DEFAULT_SCOPE = "dss/certificate-validation"
 
-    # Default scope for Cognito token requests (can be overridden in settings)
-    DEFAULT_SCOPE = getattr(django_settings, "IPDS_RE_PRESERVATION_COGNITO_SCOPE", "dss/certificate-validation")
+    client_id = _env_str("IPDS_RE_PRESERVATION_COGNITO_CLIENT_ID", DEFAULT_CLIENT_ID)
+    client_secret = _env_str("IPDS_RE_PRESERVATION_COGNITO_CLIENT_SECRET", DEFAULT_CLIENT_SECRET)
+    token_url = _env_str("IPDS_RE_PRESERVATION_COGNITO_TOKEN_URL", DEFAULT_TOKEN_URL)
+    scope = _env_str("IPDS_RE_PRESERVATION_COGNITO_SCOPE", DEFAULT_SCOPE)
 
-    client_id = getattr(django_settings, "IPDS_RE_PRESERVATION_COGNITO_CLIENT_ID", DEFAULT_CLIENT_ID)
-    client_secret = getattr(django_settings, "IPDS_RE_PRESERVATION_COGNITO_CLIENT_SECRET", DEFAULT_CLIENT_SECRET)
-    token_url = getattr(django_settings, "IPDS_RE_PRESERVATION_COGNITO_TOKEN_URL", DEFAULT_TOKEN_URL)
-    scope = getattr(django_settings, "IPDS_RE_PRESERVATION_COGNITO_SCOPE", DEFAULT_SCOPE)
-
-    # If any of the required bits are missing, skip token retrieval
     if not client_id or not client_secret or not token_url:
         return None
 
-    # Return cached token if still valid
     now = time.time()
     cached = _cognito_token_cache
     if cached.get("access_token") and cached.get("expiry_ts", 0) > now + 5:
@@ -152,23 +165,38 @@ def _fetch_cognito_token(django_settings, job, timeout=None):
         if scope:
             data["scope"] = scope
 
-        request_timeout = timeout or getattr(django_settings, "IPDS_RE_PRESERVATION_COGNITO_TIMEOUT", 10)
-        verify = getattr(django_settings, "IPDS_RE_PRESERVATION_VERIFY", True)
-        _job_log(job, "debug", "[ipds-re-preservation] sending request to cognito token endpoint with timeout={request_timeout} and verify={verify} and data={data}", icon_key="debug", request_timeout=request_timeout, verify=verify, data=data)
-        resp = requests.post(token_url, data=data, headers=headers, timeout=request_timeout, verify=verify)
+        request_timeout = timeout or _env_int("IPDS_RE_PRESERVATION_COGNITO_TIMEOUT", 10)
+        verify = _env_bool("IPDS_RE_PRESERVATION_VERIFY", True)
+
+        _job_log(
+            job,
+            "debug",
+            "[ipds-re-preservation] sending request to cognito token endpoint with timeout={request_timeout} and verify={verify} and data={data}",
+            icon_key="debug",
+            request_timeout=request_timeout,
+            verify=verify,
+            data=data,
+        )
+
+        resp = requests.post(
+            token_url,
+            data=data,
+            headers=headers,
+            timeout=request_timeout,
+            verify=verify,
+        )
         resp.raise_for_status()
+
         j = resp.json()
         token = j.get("access_token")
         if not token:
             _job_log(job, "error", "[ipds-re-preservation] Cognito response did not include access_token", icon_key="error")
             return None
 
-        # Cache token using expires_in when available
         expires_in = j.get("expires_in")
         if isinstance(expires_in, (int, float)) and expires_in > 0:
             expiry_ts = time.time() + float(expires_in)
         else:
-            # default short lived cache (e.g., 55 seconds) to avoid refetch storms
             expiry_ts = time.time() + 55
 
         _cognito_token_cache["access_token"] = token
@@ -176,9 +204,10 @@ def _fetch_cognito_token(django_settings, job, timeout=None):
 
         _job_log(job, "success", "[ipds-re-preservation] obtained Cognito access token", icon_key="success")
         return token
+
     except requests.exceptions.RequestException as exc:
         _job_log(job, "error", f"[ipds-re-preservation] error fetching Cognito token: {exc}", icon_key="error")
-        logger.debug("Cognito token response content: %s", getattr(getattr(exc, 'response', None), "text", None))
+        logger.debug("Cognito token response content: %s", getattr(getattr(exc, "response", None), "text", None))
         return None
     except Exception as exc:
         _job_log(job, "error", f"[ipds-re-preservation] unexpected error fetching Cognito token: {exc}", icon_key="error")
@@ -258,7 +287,7 @@ def _get_ipds_re_preservation(unit_uuid):
                     re_preservation,
                     doc_name or "(all files)",
                     doc_id or "",
-                )
+                    )
                 return re_preservation, doc_name, doc_id
     except Exception:
         logger.exception("Error reading UnitVariable misc_attributes for %s", unit_uuid)
@@ -457,21 +486,11 @@ def _extract_earliest_certificate_not_after(resp_json):
 def _call_signature_extension_service(job, sip_path, sip_uuid=None, ipds_doc_name="", ipds_doc_id=""):
     """Send the original document bytes to the external re-preservation service.
 
-    Settings:
-      - IPDS_RE_PRESERVATION_SERVICE_URL (str)
-      - IPDS_RE_PRESERVATION_SERVICE_HEADERS (dict)
-      - IPDS_RE_PRESERVATION_SIGNATURE_LEVEL (str, default "PAdES_BASELINE_LTA")
-      - IPDS_RE_PRESERVATION_TIMEOUT (int, seconds)
-      - IPDS_RE_PRESERVATION_VERIFY (bool | str)
-
     The response JSON is expected to contain the extended document bytes in
     `bytes` (base64) at the top level or nested under `document.bytes`.
 
     Returns True if all targeted files were successfully replaced, False otherwise.
     """
-    from django.conf import settings as django_settings
-
-    # Locate objects dir
     objects_dir = os.path.join(sip_path, "objects")
     if not os.path.isdir(objects_dir):
         objects_dir = os.path.join(sip_path, "data", "objects")
@@ -482,7 +501,6 @@ def _call_signature_extension_service(job, sip_path, sip_uuid=None, ipds_doc_nam
 
     _job_log(job, "info", "[ipds-re-preservation] CALLING SIGNATURE EXTENSION EXTERNAL SERVICE (IPDS)!", icon_key="call")
 
-    # Gather regular files sorted for deterministic order
     all_files = [
         os.path.join(objects_dir, f)
         for f in sorted(os.listdir(objects_dir))
@@ -497,7 +515,6 @@ def _call_signature_extension_service(job, sip_path, sip_uuid=None, ipds_doc_nam
     for fp in all_files:
         _job_log(job, "debug", f"[ipds-re-preservation]   {fp}", icon_key="debug")
 
-    # Filter by ipds_doc_name if provided
     if ipds_doc_name:
         logger.info(
             "[ipds-re-preservation] ipds-doc-name='%s', filtering to that file only",
@@ -508,42 +525,47 @@ def _call_signature_extension_service(job, sip_path, sip_uuid=None, ipds_doc_nam
         ]
         for fp in all_files:
             if os.path.basename(fp) != ipds_doc_name:
-                _job_log(job, "debug", f"[ipds-re-preservation] skipping {os.path.basename(fp)} (does not match ipds-doc-name='{ipds_doc_name}')", icon_key="debug")
+                _job_log(
+                    job,
+                    "debug",
+                    f"[ipds-re-preservation] skipping {os.path.basename(fp)} (does not match ipds-doc-name='{ipds_doc_name}')",
+                    icon_key="debug",
+                )
         if not target_files:
             _job_log(job, "error", f"[ipds-re-preservation] no file matching ipds-doc-name='{ipds_doc_name}' found in {objects_dir}", icon_key="error")
             return False
     else:
         target_files = all_files
 
-    external_service_url = getattr(
-        django_settings,
+    external_service_url = _env_str(
         "IPDS_RE_PRESERVATION_SERVICE_URL",
         "https://desarrollo.logalty.com/dss/services/rest/signature/one-document/extendDocument",
     )
-    service_headers = getattr(django_settings, "IPDS_RE_PRESERVATION_SERVICE_HEADERS", None)
-    signature_level = getattr(
-        django_settings, "IPDS_RE_PRESERVATION_SIGNATURE_LEVEL", "PAdES_BASELINE_LTA"
+    service_headers = _env_json_dict("IPDS_RE_PRESERVATION_SERVICE_HEADERS", {})
+    signature_level = _env_str(
+        "IPDS_RE_PRESERVATION_SIGNATURE_LEVEL",
+        "PAdES_BASELINE_LTA",
     )
-    configured_digest = getattr(django_settings, "IPDS_RE_PRESERVATION_DIGEST_ALGORITHM", "SHA256")
-    timeout = getattr(django_settings, "IPDS_RE_PRESERVATION_TIMEOUT", 60)
-    verify = getattr(django_settings, "IPDS_RE_PRESERVATION_VERIFY", True)
+    configured_digest = _env_str(
+        "IPDS_RE_PRESERVATION_DIGEST_ALGORITHM",
+        "SHA256",
+    )
+    timeout = _env_int("IPDS_RE_PRESERVATION_TIMEOUT", 60)
+    verify = _env_bool("IPDS_RE_PRESERVATION_VERIFY", True)
 
-    # Build default headers for JSON
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     if service_headers:
         headers.update(service_headers)
 
-    # If no Authorization header provided in service_headers, obtain Cognito token and fail if not retrieved
     try:
-        if "Authorization" not in {k.title(): v for k, v in headers.items()}:
-            token = _fetch_cognito_token(django_settings, job, timeout=10)
+        if not any(k.lower() == "authorization" for k in headers.keys()):
+            token = _fetch_cognito_token(job, timeout=10)
             if not token:
                 _job_log(job, "error", "[ipds-re-preservation] error: failed to obtain Cognito token; aborting request", icon_key="error")
                 return False
             headers["Authorization"] = f"Bearer {token}"
             _job_log(job, "info", "[ipds-re-preservation] added Authorization: Bearer token to request headers", icon_key="info")
     except Exception as exc:
-        # If anything unexpected happens while obtaining the token, fail the operation
         _job_log(job, "error", f"[ipds-re-preservation] error obtaining Cognito token: {exc}; aborting request", icon_key="error")
         logger.debug("Exception while fetching Cognito token", exc_info=exc)
         return False
@@ -565,16 +587,27 @@ def _call_signature_extension_service(job, sip_path, sip_uuid=None, ipds_doc_nam
                     "signatureLevel": signature_level,
                 },
             }
-            _job_log(job,"debug",f"[ipds-re-preservation] sending payload data name'{file_name}' and parameters signatureLevel '{signature_level}' to {external_service_url}")
-            # Make the HTTP request with retries for transient server/network errors.
-            max_retries = getattr(django_settings, "IPDS_RE_PRESERVATION_RETRIES", 2)
-            backoff_base = getattr(django_settings, "IPDS_RE_PRESERVATION_BACKOFF_BASE", 5)
+
+            _job_log(
+                job,
+                "debug",
+                f"[ipds-re-preservation] sending payload data name '{file_name}' and parameters signatureLevel '{signature_level}' to {external_service_url}",
+            )
+
+            max_retries = _env_int("IPDS_RE_PRESERVATION_RETRIES", 2)
+            backoff_base = _env_int("IPDS_RE_PRESERVATION_BACKOFF_BASE", 5)
             attempt = 0
             resp = None
+
             while attempt < max_retries:
                 attempt += 1
                 try:
-                    _job_log(job, "debug", f"[ipds-re-preservation] HTTP request attempt {attempt}/{max_retries} for file '{file_name}' to url '{external_service_url}'", icon_key="http")
+                    _job_log(
+                        job,
+                        "debug",
+                        f"[ipds-re-preservation] HTTP request attempt {attempt}/{max_retries} for file '{file_name}' to url '{external_service_url}'",
+                        icon_key="http",
+                    )
                     resp = requests.post(
                         external_service_url,
                         json=payload,
@@ -582,94 +615,79 @@ def _call_signature_extension_service(job, sip_path, sip_uuid=None, ipds_doc_nam
                         timeout=timeout,
                         verify=verify,
                     )
-                    # If server returns 5xx, consider retrying
+
                     if 500 <= getattr(resp, "status_code", 0) < 600:
-                        body = None
                         try:
                             body = resp.text
                         except Exception:
                             body = "<unable to read response body>"
-                        _job_log(job, "warn", f"[ipds-re-preservation] HTTP {resp.status_code} response from external service for '{file_name}': {body[:1000]} (attempt {attempt})", icon_key="http")
+                        _job_log(
+                            job,
+                            "warn",
+                            f"[ipds-re-preservation] HTTP {resp.status_code} response from external service for '{file_name}': {body[:1000]} (attempt {attempt})",
+                            icon_key="http",
+                        )
                         if attempt < max_retries:
                             sleep_for = backoff_base * (2 ** (attempt - 1))
                             _job_log(job, "info", f"[ipds-re-preservation] retrying in {sleep_for}s...", icon_key="info")
                             time.sleep(sleep_for)
                             continue
-                        else:
-                            # give up after max_retries
-                            resp.raise_for_status()
-                    else:
-                        # For non-5xx responses just check status and proceed
                         resp.raise_for_status()
-                    # Successful response -> break the retry loop
+                    else:
+                        resp.raise_for_status()
+
                     break
+
                 except requests.exceptions.RequestException as exc:
-                    # Network error or HTTP error raised by raise_for_status()
-                    if attempt < max_retries and (isinstance(exc, requests.exceptions.HTTPError) and getattr(resp, "status_code", 0) >= 500 or not isinstance(exc, requests.exceptions.HTTPError)):
+                    should_retry = (
+                            attempt < max_retries
+                            and (
+                                    (isinstance(exc, requests.exceptions.HTTPError) and getattr(resp, "status_code", 0) >= 500)
+                                    or not isinstance(exc, requests.exceptions.HTTPError)
+                            )
+                    )
+                    if should_retry:
                         sleep_for = backoff_base * (2 ** (attempt - 1))
-                        _job_log(job, "warn", f"[ipds-re-preservation] request error for '{file_name}': {exc} (attempt {attempt}), retrying in {sleep_for}s", icon_key="http")
+                        _job_log(
+                            job,
+                            "warn",
+                            f"[ipds-re-preservation] request error for '{file_name}': {exc} (attempt {attempt}), retrying in {sleep_for}s",
+                            icon_key="http",
+                        )
                         time.sleep(sleep_for)
                         continue
-                    # No more retries — log response body if available and re-raise
-                    body = None
+
                     try:
-                        if resp is not None:
-                            body = resp.text
+                        body = resp.text if resp is not None else None
                     except Exception:
                         body = "<unable to read response body>"
-                    _job_log(job, "warn", f"[ipds-re-preservation] HTTP error from external service for '{file_name}': {exc} - response: {body[:1000]}", icon_key="http")
-                    # Treat external service HTTP errors as fatal for the transfer
+
+                    _job_log(
+                        job,
+                        "warn",
+                        f"[ipds-re-preservation] HTTP error from external service for '{file_name}': {exc} - response: {body[:1000] if body else body}",
+                        icon_key="http",
+                    )
                     return False
 
-            # Parse response — expect JSON with extended document bytes (base64)
             try:
                 resp_json = resp.json()
             except Exception as exc:
                 _job_log(job, "error", f"[ipds-re-preservation] failed to parse JSON response for '{file_name}': {exc}", icon_key="error")
                 return False
 
-            # Support both flat {"bytes": "..."} and nested {"document": {"bytes": "..."}}
             extended_b64 = (
                     resp_json.get("bytes")
                     or (resp_json.get("document") or {}).get("bytes")
             )
-            # UNCOMMENT FOR TESTING WITHOUT EXTERNAL SERVICE: use hardcoded pdf
-            #obj1 = b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
-            #obj2 = b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
-            #obj3 = b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 144] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n"
-            #obj4 = b"4 0 obj\n<< /Length 36 >>\nstream\nBT\n/F1 24 Tf\n72 72 Td\n(TEST) Tj\nET\nendstream\nendobj\n"
-            #obj5 = b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n"
-
-            #pdf_bytes = b"%PDF-1.4\n" + obj1 + obj2 + obj3 + obj4 + obj5
-
-            #offset_1 = len(b"%PDF-1.4\n")
-            #offset_2 = offset_1 + len(obj1)
-            #offset_3 = offset_2 + len(obj2)
-            #offset_4 = offset_3 + len(obj3)
-            #offset_5 = offset_4 + len(obj4)
-            #xref_offset = len(pdf_bytes)
-
-                #pdf_bytes += (
-                    #b"xref\n"
-                    #b"0 6\n"
-                    #b"0000000000 65535 f \n"
-                    #+ f"{offset_1:010d} 00000 n \n".encode()
-                    #+ f"{offset_2:010d} 00000 n \n".encode()
-                    #+ f"{offset_3:010d} 00000 n \n".encode()
-                    #+ f"{offset_4:010d} 00000 n \n".encode()
-                    #+ f"{offset_5:010d} 00000 n \n".encode()
-                    #+ b"trailer\n"
-                    #  b"<< /Size 6 /Root 1 0 R >>\n"
-                    #  b"startxref\n"
-                    #+ str(xref_offset).encode()
-                #+ b"\n%%EOF\n"
-            #)
-
-            #extended_b64 = base64.b64encode(pdf_bytes).decode("ascii")
 
             if not extended_b64:
-                _job_log(job, "error", f"[ipds-re-preservation] unexpected response for '{file_name}': no 'bytes' field found. Response keys: {list(resp_json.keys())}", icon_key="error")
-                # Treat missing bytes as fatal for the transfer
+                _job_log(
+                    job,
+                    "error",
+                    f"[ipds-re-preservation] unexpected response for '{file_name}': no 'bytes' field found. Response keys: {list(resp_json.keys())}",
+                    icon_key="error",
+                )
                 return False
 
             try:
@@ -677,7 +695,7 @@ def _call_signature_extension_service(job, sip_path, sip_uuid=None, ipds_doc_nam
             except Exception as exc:
                 _job_log(job, "error", f"[ipds-re-preservation] failed to decode extended bytes for '{file_name}': {exc}", icon_key="error")
                 return False
-            # COPY extended bytes back to the original file, replacing it
+
             try:
                 with open(file_path, "wb") as out_f:
                     out_f.write(extended_bytes)
@@ -686,23 +704,26 @@ def _call_signature_extension_service(job, sip_path, sip_uuid=None, ipds_doc_nam
                 logger.exception("I/O error while writing %s", file_name)
                 return False
 
-            _job_log(job, "success", f"[ipds-re-preservation] ✅✅✅ '{file_name}' replaced with extended-signature version ({len(extended_bytes)} bytes)", icon_key="success")
+            _job_log(
+                job,
+                "success",
+                f"[ipds-re-preservation] ✅✅✅ '{file_name}' replaced with extended-signature version ({len(extended_bytes)} bytes)",
+                icon_key="success",
+            )
 
-            # --- START: VALIDATE SIGNATURE AND EXTRACT ExtensionPeriodMax ---
             try:
-                try:
-                    from django.conf import settings as django_settings
-                except Exception:
-                    django_settings = None
                 period = None
                 try:
-                    period = _validate_signature_and_extract_extension(job, extended_bytes, file_name, django_settings, headers=headers, timeout=timeout)
-                    #period = datetime.datetime.now(datetime.timezone.utc)
-
+                    period = _validate_signature_and_extract_extension(
+                        job,
+                        extended_bytes,
+                        file_name,
+                        headers=headers,
+                        timeout=timeout,
+                    )
                 except Exception as exc:
                     _job_log(job, "error", f"[ipds-re-preservation] validation call failed for '{file_name}': {exc}", icon_key="error")
                     logger.exception("Validation call failed for %s", file_name)
-                    # Treat exception as failure of validation: fail transfer immediately
                     return False
 
                 if period:
@@ -712,21 +733,15 @@ def _call_signature_extension_service(job, sip_path, sip_uuid=None, ipds_doc_nam
                         _job_log(job, "info", f"[ipds-re-preservation] ExtensionPeriodMax para '{file_name}': {period}", icon_key="info")
                 else:
                     _job_log(job, "error", f"[ipds-re-preservation] No ExtensionPeriodMax found or could not extract it for '{file_name}'", icon_key="error")
-                    # Treat missing period as fatal
                     return False
             except Exception as exc:
                 _job_log(job, "error", f"[ipds-re-preservation] error validating signature for '{file_name}': {exc}", icon_key="error")
                 logger.exception("Validation extraction failed for %s", file_name)
                 return False
-            # --- END: VALIDATE SIGNATURE ---
 
-            # --- START: SEND EVENT TO IPDS ---
-            # Send extension event; if it fails, fail the transfer
             try:
-                # Compute hash and filesize of the extended document and send them with the event
                 try:
-                    # configured_digest is available in this scope from earlier in the function
-                    algorithm = (configured_digest.lower().replace('-', '').replace('_', '')) if configured_digest else 'sha256'
+                    algorithm = (configured_digest.lower().replace("-", "").replace("_", "")) if configured_digest else "sha256"
                     h = hashlib.new(algorithm)
                     h.update(extended_bytes)
                     hash_hex = h.hexdigest()
@@ -735,18 +750,17 @@ def _call_signature_extension_service(job, sip_path, sip_uuid=None, ipds_doc_nam
                     _job_log(job, "warn", f"[ipds-re-preservation] could not compute hash/filesize for '{file_name}': {exc}", icon_key="warn")
                     hash_hex = None
                     file_size = None
-                # Send the event using ipds_doc_id (if provided) instead of the AIP UUID
+
                 sent = _send_extension_event_to_ipds(
                     job,
                     ipds_doc_id or sip_uuid,
                     period,
-                    django_settings,
                     headers=headers,
                     timeout=timeout,
                     hash_value=hash_hex,
                     file_size=file_size,
                     digest_algorithm=configured_digest,
-                )
+                    )
                 if not sent:
                     _job_log(job, "error", f"[ipds-re-preservation] failed to send extension event for '{file_name}'", icon_key="error")
                     return False
@@ -754,14 +768,12 @@ def _call_signature_extension_service(job, sip_path, sip_uuid=None, ipds_doc_nam
                 _job_log(job, "error", f"[ipds-re-preservation] error sending extension event for '{file_name}': {exc}", icon_key="error")
                 logger.exception("Error sending extension event for %s", file_name)
                 return False
-            # --- END: SEND EVENT TO IPDS ---
+
         except OSError as exc:
             _job_log(job, "error", f"[ipds-re-preservation] I/O error for '{file_name}': {exc}", icon_key="error")
             logger.exception("I/O error while handling %s", file_name)
-            # Treat I/O errors as fatal for the transfer
             return False
         except requests.exceptions.RequestException as exc:
-            # Try to extract response text from the exception if present for diagnosis
             resp_text = None
             try:
                 resp_text = getattr(exc, "response", None).text if getattr(exc, "response", None) is not None else None
@@ -769,16 +781,13 @@ def _call_signature_extension_service(job, sip_path, sip_uuid=None, ipds_doc_nam
                 resp_text = "<unable to read response body>"
             _job_log(job, "error", f"[ipds-re-preservation] HTTP error for '{file_name}': {exc} - response: {resp_text}", icon_key="http")
             logger.exception("HTTP request to IPDS service failed for %s", file_name)
-            # Treat external service HTTP errors as fatal for the transfer
             return False
         except (ValueError, KeyError) as exc:
             _job_log(job, "error", f"[ipds-re-preservation] response parse error for '{file_name}': {exc}", icon_key="error")
-            # Treat parse errors as fatal
             return False
         except Exception as exc:
             _job_log(job, "error", f"[ipds-re-preservation] unexpected error for '{file_name}': {exc}", icon_key="error")
             logger.exception("Unexpected error while processing %s", file_name)
-            # Any unexpected exception is considered fatal for the transfer
             return False
 
     _job_log(job, "success", "[ipds-re-preservation]✅✅✅ all targeted files replaced successfully", icon_key="success")
@@ -1195,7 +1204,7 @@ def _fallback_physical_restructure(job, unit_path):
     _job_log(job, "success", "Filesystem-only fallback restructure completed", icon_key="success")
 
 
-def _validate_signature_and_extract_extension(job, extended_bytes, file_name, django_settings=None, headers=None, timeout=60):
+def _validate_signature_and_extract_extension(job, extended_bytes, file_name, headers=None, timeout=60):
     """Enviar el documento firmado al endpoint de validación y devolver ExtensionPeriodMax más temprana o None.
 
     Esta versión añade logging detallado: tamaños, SHA256 de entrada y respuesta, cabeceras seguras,
@@ -1211,7 +1220,6 @@ def _validate_signature_and_extract_extension(job, extended_bytes, file_name, dj
     try:
         _job_log(job, "info", f"[ipds-re-preservation] validate_signature_and_extract_extension START for '{file_name}'", icon_key="info")
 
-        # Log basic info about the bytes we will send
         try:
             if isinstance(extended_bytes, (bytes, bytearray)):
                 original_len = len(extended_bytes)
@@ -1222,16 +1230,14 @@ def _validate_signature_and_extract_extension(job, extended_bytes, file_name, dj
         except Exception:
             logger.exception("Failed to compute hash/len of original extended bytes")
 
-        # Obtener base_url desde settings si se proporcionaron, si no usar fallback
-        base_url = None
-        if django_settings:
-            try:
-                base_url = getattr(django_settings, "IPDS_RE_PRESERVATION_SERVICE_URL", None)
-            except Exception:
-                base_url = None
+        base_url = _env_str("IPDS_RE_PRESERVATION_SERVICE_URL", None)
 
         if base_url:
-            validate_url = re.sub(r"/dss/services/rest/.+/extendDocument$", "/dss/services/rest/validation/validateSignature", base_url.rstrip("/"))
+            validate_url = re.sub(
+                r"/dss/services/rest/.+/extendDocument$",
+                "/dss/services/rest/validation/validateSignature",
+                base_url.rstrip("/"),
+            )
             if validate_url == base_url.rstrip("/"):
                 validate_url = base_url.rstrip("/") + "/dss/services/rest/validation/validateSignature"
         else:
@@ -1239,29 +1245,24 @@ def _validate_signature_and_extract_extension(job, extended_bytes, file_name, dj
 
         req_headers = {"Content-Type": "application/json", "Accept": "application/json"}
         if headers:
-            # copy headers but avoid accidentally exposing tokens in logs
             try:
                 req_headers.update(headers)
             except Exception:
                 logger.exception("Failed to update req_headers from provided headers")
 
-        # Ensure Authorization header exists
         try:
             if not any(k.lower() == "authorization" for k in req_headers.keys()):
-                token = None
-                if django_settings:
-                    try:
-                        token = _fetch_cognito_token(django_settings, job, timeout=10)
-                    except Exception as exc:
-                        _job_log(job, "warn", f"[ipds-re-preservation] warning obtaining token for validation: {exc}", icon_key="warn")
+                try:
+                    token = _fetch_cognito_token(job, timeout=10)
+                except Exception as exc:
+                    _job_log(job, "warn", f"[ipds-re-preservation] warning obtaining token for validation: {exc}", icon_key="warn")
+                    token = None
                 if token:
                     req_headers["Authorization"] = f"Bearer {token}"
-                    # Log only a safe prefix of token
                     _job_log(job, "debug", f"[ipds-re-preservation] added Authorization header with token prefix {str(token)[:8]}...", icon_key="debug")
         except Exception as exc:
             _job_log(job, "warn", f"[ipds-re-preservation] warning obtaining token for validation: {exc}", icon_key="warn")
 
-        # Prepare payload (base64-encoded bytes)
         try:
             encoded = _b64.b64encode(extended_bytes).decode("ascii") if isinstance(extended_bytes, (bytes, bytearray)) else str(extended_bytes)
         except Exception as exc:
@@ -1276,18 +1277,16 @@ def _validate_signature_and_extract_extension(job, extended_bytes, file_name, dj
             }
         }
 
-        # Log payload summary (size in chars of base64) but don't dump whole payload
         try:
             _job_log(job, "debug", f"[ipds-re-preservation] validation payload prepared for '{file_name}': base64_len={len(encoded)} chars", icon_key="debug")
         except Exception:
             logger.exception("Failed logging payload summary")
 
-        max_retries = getattr(django_settings, "IPDS_RE_PRESERVATION_RETRIES", 2) if django_settings else 2
-        backoff_base = getattr(django_settings, "IPDS_RE_PRESERVATION_BACKOFF_BASE", 5) if django_settings else 5
+        max_retries = _env_int("IPDS_RE_PRESERVATION_RETRIES", 2)
+        backoff_base = _env_int("IPDS_RE_PRESERVATION_BACKOFF_BASE", 5)
         attempt = 0
         resp = None
-        # Determine verify flag
-        verify_flag = getattr(django_settings, "IPDS_RE_PRESERVATION_VERIFY", True) if django_settings else True
+        verify_flag = _env_bool("IPDS_RE_PRESERVATION_VERIFY", True)
 
         while attempt < max_retries:
             attempt += 1
@@ -1299,7 +1298,6 @@ def _validate_signature_and_extract_extension(job, extended_bytes, file_name, dj
                 _job_log(job, "debug", f"[ipds-re-preservation] validation HTTP response status={status} for '{file_name}'", icon_key="debug")
 
                 if 500 <= (status or 0) < 600:
-                    body = None
                     try:
                         body = resp.text
                     except Exception:
@@ -1318,16 +1316,14 @@ def _validate_signature_and_extract_extension(job, extended_bytes, file_name, dj
                     _job_log(job, "warn", f"[ipds-re-preservation] validation request error for '{file_name}': {exc} (attempt {attempt}), retrying in {sleep_for}s", icon_key="http")
                     time.sleep(sleep_for)
                     continue
-                body = None
                 try:
                     body = resp.text if resp is not None else None
                 except Exception:
                     body = "<unable to read response body>"
-                _job_log(job, "error", f"[ipds-re-preservation] validation HTTP error for '{file_name}': {exc} - response: {body[:1000]}", icon_key="http")
+                _job_log(job, "error", f"[ipds-re-preservation] validation HTTP error for '{file_name}': {exc} - response: {body[:1000] if body else body}", icon_key="http")
                 logger.debug(traceback.format_exc())
                 return None
 
-        # At this point we have a successful response in resp
         try:
             resp_text = resp.text
             _job_log(job, "debug", f"[ipds-re-preservation] validation response text length={len(resp_text)} for '{file_name}'", icon_key="debug")
@@ -1336,8 +1332,6 @@ def _validate_signature_and_extract_extension(job, extended_bytes, file_name, dj
 
         try:
             resp_json = resp.json()
-            #_job_log(job, "debug", f"[ipds-re-preservation] validation response JSON '{file_name}': {resp_json}", icon_key="debug")
-        # Log top-level keys of the JSON
             try:
                 keys = list(resp_json.keys()) if isinstance(resp_json, dict) else [type(resp_json).__name__]
                 _job_log(job, "debug", f"[ipds-re-preservation] validation response JSON keys for '{file_name}': {keys}", icon_key="debug")
@@ -1348,7 +1342,6 @@ def _validate_signature_and_extract_extension(job, extended_bytes, file_name, dj
             logger.debug(traceback.format_exc())
             return None
 
-        # Extract earliest ExtensionPeriodMax using existing helper
         try:
             earliest = _extract_extension_period_max(resp_json)
             if earliest:
@@ -1369,11 +1362,10 @@ def _validate_signature_and_extract_extension(job, extended_bytes, file_name, dj
         return None
 
 
-def _send_extension_event_to_ipds(job, aip_or_doc_id, period_dt, django_settings=None, headers=None, timeout=30, hash_value=None, file_size=None, digest_algorithm=None):
+def _send_extension_event_to_ipds(job, aip_or_doc_id, period_dt, headers=None, timeout=30, hash_value=None, file_size=None, digest_algorithm=None):
     """Enviar evento de extensión al servicio externo con aip uuid (legacy) o ipds-doc-id y periodo.
 
     Payload JSON: {"ipdsDocId": ..., "extensionPeriodMax": "ISO8601", "digestAlgorithm": ..., "hash": ..., "fileSize": ...}
-    La URL puede configurarse en settings: IPDS_EXTENSION_EVENT_URL
     """
     import requests
     from requests.exceptions import RequestException
@@ -1382,49 +1374,45 @@ def _send_extension_event_to_ipds(job, aip_or_doc_id, period_dt, django_settings
         _job_log(job, "debug", "[ipds-re-preservation] no doc id or period to send extension event", icon_key="debug")
         return False
 
-    # Obtener URL desde settings si se proporcionaron
-    event_url = None
-    if django_settings:
-        try:
-            event_url = getattr(django_settings, "IPDS_EXTENSION_EVENT_URL", None)
-        except Exception:
-            event_url = None
-    if not event_url:
-        event_url = "https://ipds-dev.logalty.com/services/api/event/signature/extension"
+    event_url = _env_str(
+        "IPDS_EXTENSION_EVENT_URL",
+        "https://ipds-dev.logalty.com/services/api/event/signature/extension",
+    )
 
     req_headers = {"Content-Type": "application/json", "Accept": "application/json"}
     if headers:
         req_headers.update(headers)
 
-    # Ensure Authorization header exists
     try:
         if not any(k.lower() == "authorization" for k in req_headers.keys()):
-            token = None
-            if django_settings:
-                try:
-                    token = _fetch_cognito_token(django_settings, job, timeout=10)
-                except Exception as exc:
-                    _job_log(job, "warn", f"[ipds-re-preservation] warning obtaining token for event post: {exc}", icon_key="warn")
+            try:
+                token = _fetch_cognito_token(job, timeout=10)
+            except Exception as exc:
+                _job_log(job, "warn", f"[ipds-re-preservation] warning obtaining token for event post: {exc}", icon_key="warn")
+                token = None
             if token:
                 req_headers["Authorization"] = f"Bearer {token}"
     except Exception as exc:
         _job_log(job, "warn", f"[ipds-re-preservation] warning obtaining token for event post: {exc}", icon_key="warn")
 
-    # Use ipdsDocId as the primary identifier for the extension event. Keep string form.
-    payload = {"ipdsDocId": str(aip_or_doc_id), "extensionPeriodMax": period_dt.isoformat() if hasattr(period_dt, "isoformat") else str(period_dt)}
-    # Include digest algorithm, hash and file size when available
+    payload = {
+        "ipdsDocId": str(aip_or_doc_id),
+        "extensionPeriodMax": period_dt.isoformat() if hasattr(period_dt, "isoformat") else str(period_dt),
+    }
+
     try:
         if hash_value:
             payload["hash"] = hash_value
         if file_size is not None:
             payload["fileSize"] = int(file_size)
+        if digest_algorithm:
+            payload["digestAlgorithm"] = digest_algorithm
     except Exception:
-        # Non-fatal: continue without adding these fields if something unexpected occurs
-        logger.exception("Failed to attach hash/filesize to payload for %s", aip_or_doc_id)
+        logger.exception("Failed to attach hash/filesize/digest to payload for %s", aip_or_doc_id)
 
-    max_retries = getattr(django_settings, "IPDS_EXTENSION_EVENT_RETRIES", 2) if django_settings else 2
-    backoff_base = getattr(django_settings, "IPDS_EXTENSION_EVENT_BACKOFF_BASE", 5) if django_settings else 5
-    verify_flag = getattr(django_settings, "IPDS_RE_PRESERVATION_VERIFY", True) if django_settings else True
+    max_retries = _env_int("IPDS_EXTENSION_EVENT_RETRIES", 2)
+    backoff_base = _env_int("IPDS_EXTENSION_EVENT_BACKOFF_BASE", 5)
+    verify_flag = _env_bool("IPDS_RE_PRESERVATION_VERIFY", True)
 
     attempt = 0
     while attempt < max_retries:
@@ -1439,18 +1427,20 @@ def _send_extension_event_to_ipds(job, aip_or_doc_id, period_dt, django_settings
                     continue
                 resp.raise_for_status()
             else:
-                # Treat non-2xx as warning but don't raise unless it's 4xx/5xx
                 if resp.status_code >= 400:
                     _job_log(job, "warn", f"[ipds-re-preservation] event endpoint returned {resp.status_code}: {resp.text[:1000]}", icon_key="http")
                     return False
+
             _job_log(job, "info", f"[ipds-re-preservation] extension event sent for AIP {aip_or_doc_id}", icon_key="info")
             return True
+
         except RequestException as exc:
             if attempt < max_retries:
                 sleep_for = backoff_base * (2 ** (attempt - 1))
                 _job_log(job, "warn", f"[ipds-re-preservation] event post error: {exc} (attempt {attempt}), retrying in {sleep_for}s", icon_key="http")
                 time.sleep(sleep_for)
                 continue
+
             _job_log(job, "error", f"[ipds-re-preservation] event post failed: {exc}", icon_key="error")
             return False
 
