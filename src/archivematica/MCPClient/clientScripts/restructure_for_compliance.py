@@ -125,6 +125,14 @@ def _env_json_dict(name, default=None):
         logger.warning("Invalid JSON in environment variable %s: %r", name, raw)
         return {} if default is None else default
 
+def _signature_level_for_file(file_name):
+    ext = os.path.splitext(file_name)[1].lower()
+    if ext == ".pdf":
+        return "PAdES_BASELINE_LTA"
+    if ext == ".xml":
+        return "XAdES_BASELINE_LTA"
+    return None
+
 def _fetch_cognito_token(job, timeout=None):
     """Fetch an OAuth2 token from Cognito using client_credentials.
 
@@ -542,10 +550,6 @@ def _call_signature_extension_service(job, sip_path, sip_uuid=None, ipds_doc_nam
         "https://desarrollo.logalty.com/dss/services/rest/signature/one-document/extendDocument",
     )
     service_headers = _env_json_dict("IPDS_RE_PRESERVATION_SERVICE_HEADERS", {})
-    signature_level = _env_str(
-        "IPDS_RE_PRESERVATION_SIGNATURE_LEVEL",
-        "PAdES_BASELINE_LTA",
-    )
     configured_digest = _env_str(
         "IPDS_RE_PRESERVATION_DIGEST_ALGORITHM",
         "SHA256",
@@ -572,6 +576,16 @@ def _call_signature_extension_service(job, sip_path, sip_uuid=None, ipds_doc_nam
 
     for file_path in target_files:
         file_name = os.path.basename(file_path)
+        signature_level = _signature_level_for_file(file_name)
+
+        if not signature_level:
+            _job_log(
+                job,
+                "error",
+                f"[ipds-re-preservation] unsupported file extension for '{file_name}'",
+                icon_key="error",
+            )
+            return False
         _job_log(job, "info", f"[ipds-re-preservation] sending '{file_name}' to {external_service_url}", icon_key="http")
 
         try:
