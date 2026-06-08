@@ -24,6 +24,7 @@ from django.db import transaction
 from archivematica.archivematicaCommon import databaseFunctions
 from archivematica.archivematicaCommon import fileOperations
 from archivematica.archivematicaCommon.dicts import ReplacementDict
+from archivematica.dashboard.fpr.models import FormatVersion
 from archivematica.dashboard.fpr.models import FPRule
 from archivematica.dashboard.main.models import Derivation
 from archivematica.dashboard.main.models import File
@@ -36,6 +37,24 @@ from archivematica.MCPClient.clientScripts.lib import setup_dicts
 SUCCESS = 0
 RULE_FAILED = 1
 NO_RULE_FOUND = 2
+
+
+def write_file_id(file_uuid: str, format_version: FormatVersion) -> None:
+    """Write normalized file format metadata used to generate the METS."""
+    if format_version.pronom_id:
+        format_registry = "PRONOM"
+        format_registry_key = format_version.pronom_id
+    else:
+        format_registry = "Archivematica Format Policy Registry"
+        format_registry_key = format_version.description or ""
+
+    FileID.objects.create(
+        file_id=file_uuid,
+        format_name=format_version.format.description,
+        format_version=format_version.version or "",
+        format_registry_name=format_registry,
+        format_registry_key=format_registry_key,
+    )
 
 
 @dataclasses.dataclass
@@ -305,10 +324,7 @@ def once_normalized(
         )
         ffv.save()
 
-        FileID.objects.create(
-            file_id=output_file_uuid,
-            format_name=command.fpcommand.output_format.format.description,
-        )
+        write_file_id(output_file_uuid, command.fpcommand.output_format)
 
 
 def once_normalized_callback(job: Job) -> Callable[..., None]:
