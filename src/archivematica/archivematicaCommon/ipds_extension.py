@@ -41,6 +41,8 @@ import json
 import logging
 import os
 import re
+import tempfile
+import threading
 import time
 
 import requests
@@ -56,9 +58,30 @@ class IPDSExtensionError(Exception):
 
 # ---------------------------------------------------------------------------
 # In-process Cognito token cache (module-level singleton)
+# Thread-safe via a lock to prevent concurrent token refreshes.
 # ---------------------------------------------------------------------------
 
+_cognito_token_lock = threading.Lock()
 _cognito_token_cache: dict = {"access_token": None, "expiry_ts": 0.0}
+
+# Allowlist of hash algorithms accepted for the IPDS extension event
+_ALLOWED_HASH_ALGORITHMS = frozenset(
+    {
+        "md5",
+        "sha1",
+        "sha224",
+        "sha256",
+        "sha384",
+        "sha512",
+        "sha3224",
+        "sha3256",
+        "sha3384",
+        "sha3512",
+    }
+)
+
+# Maximum sleep time (seconds) between HTTP retry attempts
+_MAX_BACKOFF_SLEEP = 60
 
 # ---------------------------------------------------------------------------
 # Environment helpers
@@ -118,11 +141,9 @@ def signature_level_for_file(file_name: str) -> str | None:
 # Cognito token
 # ---------------------------------------------------------------------------
 
-_DEFAULT_COGNITO_CLIENT_ID = "4jheas80l5e79c4peue3gonh7m"
-_DEFAULT_COGNITO_CLIENT_SECRET = "pc6n26cdc60efn99vi8ms8if636g6i0btaeuamo2ooho57qlouh"
-_DEFAULT_COGNITO_TOKEN_URL = (
-    "https://api-auth-dev-logalty.auth.eu-west-1.amazoncognito.com/oauth2/token"
-)
+_DEFAULT_COGNITO_CLIENT_ID = ""
+_DEFAULT_COGNITO_CLIENT_SECRET = ""
+_DEFAULT_COGNITO_TOKEN_URL = ""
 _DEFAULT_COGNITO_SCOPE = "dss/certificate-validation"
 
 
@@ -145,10 +166,11 @@ def fetch_cognito_token(logger=None, timeout: int | None = None) -> str | None:
         return None
 
     now = time.time()
-    cached = _cognito_token_cache
-    if cached.get("access_token") and cached.get("expiry_ts", 0) > now + 5:
-        logger.debug("[ipds] using cached Cognito token")
-        return cached["access_token"]
+    with _cognito_token_lock:
+        cached = _cognito_token_cache
+        if cached.get("access_token") and cached.get("expiry_ts", 0) > now + 5:
+            logger.debug("[ipds] using cached Cognito token")
+            return cached["access_token"]
 
     try:
         credentials = f"{client_id}:{client_secret}"
@@ -185,8 +207,9 @@ def fetch_cognito_token(logger=None, timeout: int | None = None) -> str | None:
         else:
             expiry_ts = time.time() + 55
 
-        _cognito_token_cache["access_token"] = token
-        _cognito_token_cache["expiry_ts"] = expiry_ts
+        with _cognito_token_lock:
+            _cognito_token_cache["access_token"] = token
+            _cognito_token_cache["expiry_ts"] = expiry_ts
 
         logger.info("[ipds] obtained Cognito access token")
         return token
@@ -367,7 +390,7 @@ def _post_with_retry(
             resp = requests.post(url, json=payload, headers=headers, timeout=timeout, verify=verify)
             if 500 <= getattr(resp, "status_code", 0) < 600:
                 if attempt < max_retries:
-                    sleep_for = backoff_base * (2 ** (attempt - 1))
+                    sleep_for = min(backoff_base * (2 ** (attempt - 1)), _MAX_BACKOFF_SLEEP)
                     logger.warning(
                         "[ipds] HTTP %s from %s (attempt %d), retrying in %ds",
                         resp.status_code, url, attempt, sleep_for,
@@ -384,7 +407,7 @@ def _post_with_retry(
                 or getattr(resp, "status_code", 0) >= 500
             )
             if should_retry:
-                sleep_for = backoff_base * (2 ** (attempt - 1))
+                sleep_for = min(backoff_base * (2 ** (attempt - 1)), _MAX_BACKOFF_SLEEP)
                 logger.warning("[ipds] request error (attempt %d): %s, retrying in %ds", attempt, exc, sleep_for)
                 time.sleep(sleep_for)
                 continue
@@ -420,7 +443,11 @@ def validate_signature_and_extract_period(
         if validate_url == base_url.rstrip("/"):
             validate_url = base_url.rstrip("/") + "/dss/services/rest/validation/validateSignature"
     else:
-        validate_url = "https://desarrollo.logalty.com/dss/services/rest/validation/validateSignature"
+        validate_url = _env_str("IPDS_RE_PRESERVATION_VALIDATE_URL", "")
+
+    if not validate_url:
+        logger.warning("[ipds] no validation URL configured; skipping signature validation")
+        return None
 
     req_headers = {"Content-Type": "application/json", "Accept": "application/json"}
     req_headers.update(headers)
@@ -477,8 +504,11 @@ def send_extension_event(
 
     event_url = _env_str(
         "IPDS_EXTENSION_EVENT_URL",
-        "https://ipds-dev.logalty.com/services/api/event/signature/extension",
+        "",
     )
+    if not event_url:
+        logger.warning("[ipds] IPDS_EXTENSION_EVENT_URL not configured; skipping extension event")
+        return False
 
     req_headers = {"Content-Type": "application/json", "Accept": "application/json"}
     req_headers.update(headers)
@@ -544,8 +574,12 @@ def _extend_single_file(
 
     external_service_url = _env_str(
         "IPDS_RE_PRESERVATION_SERVICE_URL",
-        "https://desarrollo.logalty.com/dss/services/rest/signature/one-document/extendDocument",
+        "",
     )
+    if not external_service_url:
+        raise IPDSExtensionError(
+            "IPDS_RE_PRESERVATION_SERVICE_URL is not configured; cannot extend signatures"
+        )
     service_headers = _env_json_dict("IPDS_RE_PRESERVATION_SERVICE_HEADERS", {})
     verify = _env_bool("IPDS_RE_PRESERVATION_VERIFY", True)
     max_retries = _env_int("IPDS_RE_PRESERVATION_RETRIES", 2)
@@ -590,9 +624,26 @@ def _extend_single_file(
             f"failed to decode extended bytes for '{file_name}': {exc}"
         ) from exc
 
-    # Write extended document back to disk
-    with open(file_path, "wb") as fh:
-        fh.write(extended_bytes)
+    # Write extended document back to disk atomically (temp file + rename)
+    dir_name = os.path.dirname(file_path)
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=dir_name, prefix=".ipds_ext_")
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(extended_bytes)
+            os.replace(tmp_path, file_path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    except IPDSExtensionError:
+        raise
+    except Exception as exc:
+        raise IPDSExtensionError(
+            f"failed to write extended document to '{file_path}': {exc}"
+        ) from exc
 
     logger.info("[ipds] '%s' replaced with extended-signature version (%d bytes)", file_name, len(extended_bytes))
 
@@ -606,9 +657,15 @@ def _extend_single_file(
         )
     logger.info("[ipds] ExtensionPeriodMax for '%s': %s", file_name, period.isoformat())
 
-    # Compute hash for the event
+    # Compute hash for the event (validate algorithm against allowlist)
     try:
-        algorithm = (configured_digest.lower().replace("-", "").replace("_", "")) if configured_digest else "sha256"
+        raw_algorithm = (configured_digest.lower().replace("-", "").replace("_", "")) if configured_digest else "sha256"
+        algorithm = raw_algorithm if raw_algorithm in _ALLOWED_HASH_ALGORITHMS else "sha256"
+        if raw_algorithm and raw_algorithm not in _ALLOWED_HASH_ALGORITHMS:
+            logger.warning(
+                "[ipds] unsupported digest algorithm '%s'; falling back to sha256",
+                configured_digest,
+            )
         h = hashlib.new(algorithm)
         h.update(extended_bytes)
         hash_hex = h.hexdigest()
